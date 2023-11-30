@@ -3,77 +3,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-######################## Setup
-
-dropout = 0.0
-context_length = 32
-
-# hyperparameters
-batch_size = 16 # how many independent sequences will we process in parallel?
-context_length = 32 # what is the maximum context length for predictions?
-max_iters = 1
-eval_interval = 100
-learning_rate = 1e-3
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 200
-embedding_dimensions = 64
-n_head = 4
-n_layer = 4
-dropout = 0.0
-
-torch.manual_seed(1337)
-
-with open('tinyshakespeare.txt', 'r', encoding='utf-8') as f:
-    text = f.read()
-
-# here are all the unique characters that occur in this text
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-
-# create a mapping from characters to integers
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-encode = lambda s: [stoi[c] for c in s] # encoder: take a string, output a list of integers
-decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
-
-# Train and test splits
-data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(data)) # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
-
-######################## Helpers
-
-# data loading
-def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - context_length, (batch_size,))
-    x = torch.stack([data[i:i+context_length] for i in ix])
-    y = torch.stack([data[i+1:i+context_length+1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
-
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
-
-######################## Transformer decoder
-
 class Head(nn.Module):
     """ one head of self-attention """
 
-    def __init__(self, head_size):
+    def __init__(self, head_size, context_length, embedding_dimensions, dropout):
         super().__init__()
 
         """
@@ -155,23 +88,29 @@ class Head(nn.Module):
         return out
     
 class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel """
 
-    def __init__(self, num_heads, head_size):
+    def __init__(self, num_heads, head_size, context_length, embedding_dimensions, dropout):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(embedding_dimensions, embedding_dimensions)
+
+        self.heads = nn.ModuleList([Head(head_size, context_length, embedding_dimensions, dropout) for _ in range(num_heads)])
+        self.linear_layer_projection = nn.Linear(embedding_dimensions, embedding_dimensions)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+
+        """
+        Multiple heads are concatinated and fed through a linear layer, the linear layer will learn which head it should use with respect to the input.
+        Different heads can learn different nuances of the input.
+        """
+
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
+        out = self.dropout(self.linear_layer_projection(out))
+
         return out
     
 class FeedFoward(nn.Module):
-    """ a simple linear layer followed by a non-linearity """
 
-    def __init__(self, embedding_dimensions):
+    def __init__(self, embedding_dimensions, dropout):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(embedding_dimensions, 4 * embedding_dimensions),
@@ -184,59 +123,72 @@ class FeedFoward(nn.Module):
         return self.net(x)
 
 class Block(nn.Module):
-    """ Transformer block: communication followed by computation """
 
-    def __init__(self, embedding_dimensions, n_head):
+    def __init__(self, embedding_dimensions, n_head, context_length, dropout):
+
         # embedding_dimensions: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
         head_size = embedding_dimensions // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedFoward(embedding_dimensions)
-        self.ln1 = nn.LayerNorm(embedding_dimensions)
-        self.ln2 = nn.LayerNorm(embedding_dimensions)
+        self.multi_head_attention = MultiHeadAttention(n_head, head_size, context_length, embedding_dimensions, dropout)
+        self.feed_forward = FeedFoward(embedding_dimensions, dropout)
+        self.layer_normalisation_1 = nn.LayerNorm(embedding_dimensions)
+        self.layer_normalisation_2 = nn.LayerNorm(embedding_dimensions)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
+
+        x = x + self.multi_head_attention(self.layer_normalisation_1(x))
+        x = x + self.feed_forward(self.layer_normalisation_2(x))
+
         return x
 
 class TransformerDecoderModel(nn.Module):
 
-    def __init__(self):
+    def __init__(self, vocab_size, context_length, embedding_dimensions, n_head, n_layer, dropout, device):
         super().__init__()
+
+        self.context_length = context_length
+        self.device = device
+
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, embedding_dimensions)
-        self.position_embedding_table = nn.Embedding(context_length, embedding_dimensions)
-        self.blocks = nn.Sequential(*[Block(embedding_dimensions, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(embedding_dimensions) # final layer norm
-        self.lm_head = nn.Linear(embedding_dimensions, vocab_size)
+        self.position_embedding_table = nn.Embedding(self.context_length, embedding_dimensions)
+        self.transformer_blocks = nn.Sequential(*[Block(embedding_dimensions, n_head=n_head, context_length=context_length, dropout=dropout) for _ in range(n_layer)])
+        self.final_layer_normalisation = nn.LayerNorm(embedding_dimensions) # final layer norm
+        self.final_linear_head = nn.Linear(embedding_dimensions, vocab_size)
 
     def forward(self, idx, targets=None):
-        B, T = idx.shape
+        B, vocab_size = idx.shape
 
-        # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
-        x = tok_emb + pos_emb # (B,T,C)
-        x = self.blocks(x) # (B,T,C)
-        x = self.ln_f(x) # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
+        # We input token_embedding + positional_embedding to the transformer
+        token_embedding = self.token_embedding_table(idx) # (B,T,C)
+        positional_embedding = self.position_embedding_table(torch.arange(vocab_size, device=self.device)) # (T,C)
+        x = token_embedding + positional_embedding # (B,T,C)
+
+        # Go through stacked transformer blocks
+        x = self.transformer_blocks(x) # (B,T,C)
+
+        # Normalise the final layer
+        x = self.final_layer_normalisation(x) # (B,T,C)
+
+        # Get logits out
+        logits = self.final_linear_head(x) # (B,T,vocab_size)
 
         if targets is None:
             loss = None
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
+            B, vocab_size, C = logits.shape
+            logits = logits.view(B*vocab_size, C)
+            targets = targets.view(B*vocab_size)
             loss = F.cross_entropy(logits, targets)
 
         return logits, loss
 
     def generate(self, idx, max_new_tokens):
+
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last context_length tokens
-            idx_cond = idx[:, -context_length:]
+            idx_cond = idx[:, -self.context_length:]
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
@@ -249,31 +201,3 @@ class TransformerDecoderModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
     
-
-model = TransformerDecoderModel()
-m = model.to(device)
-# print the number of parameters in the model
-print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
-
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
-for iter in range(max_iters):
-
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-    # sample a batch of data
-    xb, yb = get_batch('train')
-
-    # evaluate the loss
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-
-# generate from the model
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=2000)[0].tolist()))
